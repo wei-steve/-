@@ -1,11 +1,187 @@
 <!DOCTYPE html>
 <html>
 <head>
-    <script src="/assets/lightweight_charts.js"></script>
-    <script src="/assets/chart.js"></script>
+    <script src="https://unpkg.com/lightweight-charts/dist/lightweight-charts.standalone.production.js"></script>
+    <style>
+        body, html {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            overflow: hidden;
+            background-color: #1a1a1a;
+        }
+        #chart-container {
+            width: 100%;
+            height: 100%;
+        }
+    </style>
 </head>
-<body style="margin: 0;">
-    <div id="lightweight-chart"></div>
-    <input type="hidden" id="lwc-data-store" value='{{lwc_data}}'>
+<body>
+    <div id="chart-container"></div>
+    <script>
+        // 初始化 Lightweight Charts
+        const chart = LightweightCharts.createChart(document.getElementById('chart-container'), {
+            width: window.innerWidth,
+            height: window.innerHeight,
+            layout: {
+                backgroundColor: '#1a1a1a',
+                textColor: '#d1d4dc',
+            },
+            grid: {
+                vertLines: { color: '#2a2e39' },
+                horzLines: { color: '#2a2e39' },
+            },
+            timeScale: {
+                timeVisible: true,
+                secondsVisible: true,
+            },
+        });
+
+        const candleSeries = chart.addCandlestickSeries({
+            upColor: '#26a69a',
+            downColor: '#ef5350',
+            borderVisible: false,
+            wickUpColor: '#26a69a',
+            wickDownColor: '#ef5350',
+        });
+
+        const volumeSeries = chart.addHistogramSeries({
+            color: '#26a69a',
+            priceFormat: { type: 'volume' },
+            priceScaleId: '',
+            scaleMargins: { top: 0.8, bottom: 0 },
+        });
+
+        let indicatorSeries = null;
+        let buyMarkers = [];
+        let sellMarkers = [];
+
+        // 从 Dash 获取初始数据
+        function getInitialData() {
+            return new Promise((resolve) => {
+                window.dash_clientside = window.dash_clientside || {};
+                window.dash_clientside.chart = {
+                    getLwcData: () => {
+                        return JSON.parse(document.getElementById('lwc-data-store').value);
+                    }
+                };
+                const interval = setInterval(() => {
+                    try {
+                        const data = window.dash_clientside.chart.getLwcData();
+                        if (data) {
+                            clearInterval(interval);
+                            resolve(data);
+                        }
+                    } catch (e) {
+                        console.error('等待初始数据:', e);
+                    }
+                }, 100);
+            });
+        }
+
+        // 更新图表数据
+        function updateChart(data) {
+            if (data.candlestick) {
+                candleSeries.setData(data.candlestick);
+            }
+            if (data.volume) {
+                volumeSeries.setData(data.volume);
+            }
+            if (data.indicator) {
+                if (!indicatorSeries) {
+                    indicatorSeries = chart.addLineSeries({
+                        color: 'purple',
+                        priceScaleId: 'right',
+                        scaleMargins: { top: 0.7, bottom: 0.1 },
+                    });
+                }
+                indicatorSeries.setData(data.indicator.values);
+                // 添加指标线（如布林带的上轨和下轨）
+                if (data.indicator.shapes) {
+                    data.indicator.shapes.forEach(shape => {
+                        chart.addLineSeries({
+                            color: shape.color,
+                            lineStyle: LightweightCharts.LineStyle.Dashed,
+                            priceScaleId: 'right',
+                            scaleMargins: { top: 0.7, bottom: 0.1 },
+                        }).setData([
+                            { time: data.candlestick[0].time / 1000, value: shape.y },
+                            { time: data.candlestick[data.candlestick.length - 1].time / 1000, value: shape.y }
+                        ]);
+                    });
+                }
+            }
+            if (data.buy_signals) {
+                buyMarkers = data.buy_signals.map(signal => ({
+                    time: new Date(signal.time).getTime() / 1000,
+                    position: signal.position,
+                    shape: signal.shape,
+                    color: signal.color,
+                    text: `买入: ${signal.value}`
+                }));
+                candleSeries.setMarkers(buyMarkers);
+            }
+            if (data.sell_signals) {
+                sellMarkers = data.sell_signals.map(signal => ({
+                    time: new Date(signal.time).getTime() / 1000,
+                    position: signal.position,
+                    shape: signal.shape,
+                    color: signal.color,
+                    text: `卖出: ${signal.value}`
+                }));
+                candleSeries.setMarkers([...buyMarkers, ...sellMarkers]);
+            }
+        }
+
+        // 初始化图表
+        getInitialData().then(data => {
+            updateChart(data);
+            // 设置初始可见范围
+            if (data.candlestick && data.candlestick.length > 0) {
+                const lastCandleTime = new Date(data.candlestick[data.candlestick.length - 1].time).getTime() / 1000;
+                chart.timeScale().setVisibleRange({
+                    from: lastCandleTime - 300 * 60, // 300 分钟前
+                    to: lastCandleTime
+                });
+            }
+        });
+
+        // 监听可见范围变化（拖动事件）
+        chart.timeScale().subscribeVisibleLogicalRangeChange(range => {
+            if (range) {
+                const visibleRange = chart.timeScale().getVisibleLogicalRange();
+                if (visibleRange) {
+                    const barsInfo = candleSeries.barsInLogicalRange(visibleRange);
+                    if (barsInfo && (barsInfo.barsBefore < 50 || barsInfo.barsAfter < 50)) {
+                        // 当剩余的数据不足 50 根 K 线时，请求新数据
+                        const timeRange = chart.timeScale().getVisibleRange();
+                        if (timeRange) {
+                            // 将可见范围存储到 Dash 的 Store 中
+                            document.getElementById('lwc-visible-range').value = JSON.stringify({
+                                from: timeRange.from,
+                                to: timeRange.to
+                            });
+                            // 触发 Dash 事件
+                            const event = new Event('input', { bubbles: true });
+                            document.getElementById('lwc-visible-range').dispatchEvent(event);
+                        }
+                    }
+                }
+            }
+        });
+
+        // 监听 lwc-data-store 变化，更新图表
+        const observer = new MutationObserver(() => {
+            const data = JSON.parse(document.getElementById('lwc-data-store').value);
+            updateChart(data);
+        });
+        observer.observe(document.getElementById('lwc-data-store'), { attributes: true, childList: true, subtree: true });
+
+        // 自适应窗口大小
+        window.addEventListener('resize', () => {
+            chart.resize(window.innerWidth, window.innerHeight);
+        });
+    </script>
 </body>
 </html>
