@@ -1,5 +1,5 @@
+# 导入必要的库
 import pandas as pd
-import sqlite3
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import dash
@@ -10,443 +10,482 @@ from io import StringIO
 import sys
 import json
 import logging
+import os
+import argparse
+import requests
 from strategy_registry import registry
-from backtest_engine import backtest_engine
+from backtest_engine import BacktraderEngine
+from functools import lru_cache
+import time
 
-# 设置日志级别为 WARNING，仅输出关键信息
-logging.getLogger().setLevel(logging.WARNING)
+# 设置日志配置（确保只初始化一次）
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.WARNING)
+logger.handlers.clear()  # 清除所有已存在的处理器，避免重复
+logger.setLevel(logging.INFO)
 handler = logging.StreamHandler()
-handler.setLevel(logging.WARNING)
+handler.setLevel(logging.INFO)
 formatter = logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
 handler.setFormatter(formatter)
 logger.addHandler(handler)
 file_handler = logging.FileHandler('debug.log')
-file_handler.setLevel(logging.WARNING)
+file_handler.setLevel(logging.INFO)
 file_handler.setFormatter(formatter)
 logger.addHandler(file_handler)
 
-# 加载策略
-sys.path.append(r'D:\策略研究\回测功能\strategies')
-import rsi_strategy
-import bollinger_strategy
+# 定义文件路径和 API 地址
+BASE_DIR = os.path.dirname(__file__)
+TEST_DATA_PATH = os.path.join(BASE_DIR, 'test_data', 'kline_test_data.csv')
+sys.path.append(os.path.join(BASE_DIR, 'strategies'))
+API_URL = "http://47.251.103.179:8000/kline"
+HEALTH_URL = "http://47.251.103.179:8000/health"
 
-# 获取所有策略类
-strategy_classes = registry.get_all_strategies()
+# 解析命令行参数
+parser = argparse.ArgumentParser(description='Backtrader Plotly with Test Data Option')
+parser.add_argument('--use-test-data', action='store_true', help='Use test data instead of API')
+args = parser.parse_args()
 
-# 创建 STRATEGIES 字典，提前解析 display_name 和 description
-STRATEGIES = {}
-for strategy_name, strategy_class in strategy_classes.items():
-    strategy_instance = strategy_class()
-    STRATEGIES[strategy_name] = {
-        'class': strategy_class,
-        'display_name': strategy_instance.display_name,
-        'description': strategy_instance.description,
-        'params': strategy_instance.params,
-        'param_schema': strategy_instance.param_schema
-    }
-
-# 查询数据库时间范围
-def get_db_time_range(db_path, coin_name='LEAUSDT', interval='1m'):
+# 检查 API 健康状态
+def check_api_health():
     try:
-        conn = sqlite3.connect(db_path)
-        query = f"""
-            SELECT MIN(timestamp), MAX(timestamp)
-            FROM kline_data
-            WHERE coin_name = ? AND interval = ?
-        """
-        cursor = conn.cursor()
-        cursor.execute(query, (coin_name, interval))
-        min_timestamp, max_timestamp = cursor.fetchone()
-        conn.close()
-        if min_timestamp and max_timestamp:
-            min_time = pd.to_datetime(min_timestamp, unit='s')
-            max_time = pd.to_datetime(max_timestamp, unit='s')
-            return min_time, max_time
-        return datetime.now() - timedelta(days=180), datetime.now()
+        response = requests.get(HEALTH_URL, timeout=5)
+        response.raise_for_status()
+        logger.info(f"API 健康检查成功：{response.json()}")
+        return True
     except Exception as e:
-        logger.error(f"查询时间范围错误：{e}")
+        logger.error(f"API 健康检查失败：{e}")
+        return False
+
+# 获取并初始化所有策略（避免重复注册）
+STRATEGIES = {}
+strategy_classes = registry.get_all_strategies()
+if not strategy_classes:
+    registry.discover_strategies("strategies")
+    strategy_classes = registry.get_all_strategies()
+# 去重策略
+unique_strategy_classes = {}
+for strategy_name, strategy_class in strategy_classes.items():
+    if strategy_name not in unique_strategy_classes:
+        unique_strategy_classes[strategy_name] = strategy_class
+for strategy_name, strategy_class in unique_strategy_classes.items():
+    try:
+        strategy_instance = strategy_class()
+        STRATEGIES[strategy_name] = {
+            'class': strategy_class,
+            'display_name': strategy_instance.display_name,
+            'description': strategy_instance.description,
+            'params': strategy_instance.params,
+            'param_schema': strategy_instance.param_schema
+        }
+        logger.info(f"注册策略: {strategy_name}")
+    except Exception as e:
+        logger.error(f"初始化策略 {strategy_name} 失败：{e}")
+
+# 查询 API 时间范围
+def get_api_time_range(coin_name='LEAUSDT', interval='1m'):
+    try:
+        # 获取最早时间
+        params_earliest = {
+            "coin_name": coin_name,
+            "interval": interval,
+            "limit": 1
+        }
+        response_earliest = requests.get(API_URL, params=params_earliest, timeout=10)
+        response_earliest.raise_for_status()
+        data_earliest = response_earliest.json().get("data", [])
+        if not data_earliest:
+            logger.warning("API 返回空数据（最早时间），尝试更早时间")
+            return datetime.now() - timedelta(days=180), datetime.now()
+
+        min_timestamp = pd.to_datetime(data_earliest[0]["timestamp"])
+
+        # 获取最晚时间（从当前时间向前尝试）
+        max_attempts = 30
+        current_time = datetime.now()
+        max_timestamp = None
+        for attempt in range(max_attempts):
+            params_latest = {
+                "coin_name": coin_name,
+                "interval": interval,
+                "limit": 1,
+                "start_time": (current_time - timedelta(days=attempt)).isoformat()
+            }
+            response_latest = requests.get(API_URL, params=params_latest, timeout=10)
+            response_latest.raise_for_status()
+            data_latest = response_latest.json().get("data", [])
+            if data_latest:
+                max_timestamp = pd.to_datetime(data_latest[0]["timestamp"])
+                break
+        if max_timestamp is None:
+            logger.warning("无法获取最新数据，设置默认时间范围")
+            return datetime.now() - timedelta(days=180), datetime.now()
+
+        return min_timestamp, max_timestamp
+    except Exception as e:
+        logger.error(f"查询 API 时间范围错误：{e}")
         return datetime.now() - timedelta(days=180), datetime.now()
 
-# 数据加载函数
-def load_kline_data(db_path, coin_name='LEAUSDT', interval='1m', start_timestamp=None, end_timestamp=None, limit=None, chunk_size=10000):
-    cache_key = f"{coin_name}_{interval}_{start_timestamp}_{end_timestamp}_{limit}"
-    if cache_key in KLINE_CACHE:
-        return KLINE_CACHE[cache_key]
+# 公共数据加载和重采样函数
+def load_and_resample_data(start_time, cycle, coin_name='LEAUSDT', interval='1m'):
+    """加载并重采样 K 线数据"""
+    try:
+        interval_minutes = {'1m': 1, '5m': 5, '15m': 15, '30m': 30, '1h': 60, '4h': 240, '1D': 1440, '1W': 10080, '1M': 43200}
+        cycle_minutes = interval_minutes.get(cycle, 1)
+        required_candles = 2000 if cycle == '1m' else 2000 * (cycle_minutes // interval_minutes[interval])
+        data = load_kline_data(coin_name, interval, start_timestamp=start_time, limit=required_candles)
+        if data.empty:
+            logger.warning(f"加载数据为空：开始时间={start_time}")
+            return pd.DataFrame(columns=['open', 'high', 'low', 'close', 'volume'])
+        resampled_data = resample_kline_data(data, cycle)
+        if len(resampled_data) < 300:
+            logger.warning(f"重采样后数据不足，周期={cycle}，K线数量={len(resampled_data)}")
+        return resampled_data
+    except Exception as e:
+        logger.error(f"加载和重采样数据失败：{e}, 参数={locals()}")
+        return pd.DataFrame(columns=['open', 'high', 'low', 'close', 'volume'])
+
+# 数据加载函数（带 LRU 缓存）
+@lru_cache(maxsize=10)
+def load_kline_data(coin_name='LEAUSDT', interval='1m', start_timestamp=None, limit=None, chunk_size=10000):
+    if args.use_test_data and os.path.exists(TEST_DATA_PATH):
+        logger.info(f"从测试数据加载：{TEST_DATA_PATH}")
+        try:
+            data = pd.read_csv(TEST_DATA_PATH, index_col='timestamp', parse_dates=True)
+            data.index = pd.to_datetime(data.index, unit='s')
+            return data
+        except Exception as e:
+            logger.error(f"加载测试数据失败：{e}, 路径={TEST_DATA_PATH}")
+            return pd.DataFrame()
     
     try:
-        conn = sqlite3.connect(db_path)
+        params = {
+            "coin_name": coin_name,
+            "interval": interval,
+            "limit": limit if limit else chunk_size
+        }
+        if start_timestamp:
+            params["start_time"] = start_timestamp.isoformat()
+        
         data_chunks = []
-        offset = 0
-        query_limit = limit if limit else -1
-        while True:
-            query = f"""
-                SELECT timestamp, open, high, low, close, volume
-                FROM kline_data
-                WHERE coin_name = ? AND interval = ? AND timestamp >= ? AND timestamp <= ?
-                ORDER BY timestamp ASC
-                LIMIT ? OFFSET ?
-            """
-            params = (coin_name, interval, int(start_timestamp.timestamp()), int(end_timestamp.timestamp()), chunk_size, offset)
-            df_chunk = pd.read_sql_query(query, conn, params=params)
-            if df_chunk.empty:
+        total_limit = limit if limit else float('inf')
+        current_start = start_timestamp
+        while len(data_chunks) * chunk_size < total_limit:
+            params["limit"] = min(chunk_size, total_limit - len(data_chunks) * chunk_size)
+            if current_start:
+                params["start_time"] = current_start.isoformat()
+            response = requests.get(API_URL, params=params, timeout=10)
+            response.raise_for_status()
+            kline_data = response.json().get("data", [])
+            if not kline_data:
                 break
-            df_chunk['timestamp'] = pd.to_datetime(df_chunk['timestamp'], unit='s')
+            df_chunk = pd.DataFrame(kline_data)
+            df_chunk['timestamp'] = pd.to_datetime(df_chunk['timestamp'])
             df_chunk.set_index('timestamp', inplace=True)
-            df_chunk.columns = ['open', 'high', 'low', 'close', 'volume']
+            df_chunk = df_chunk[['open', 'high', 'low', 'close', 'volume']]
             for col in ['open', 'high', 'low', 'close', 'volume']:
                 df_chunk[col] = pd.to_numeric(df_chunk[col], errors='coerce')
             data_chunks.append(df_chunk)
-            offset += chunk_size
-            if limit and offset >= limit:
-                break
-        conn.close()
+            # 更新 start_time 为最后一条记录的时间，获取更早的数据
+            current_start = df_chunk.index.min()
         if not data_chunks:
-            logger.warning("数据库返回空数据")
+            logger.warning(f"API 返回空数据：参数={params}")
             return pd.DataFrame()
         data = pd.concat(data_chunks).sort_index()
         data = data[~data.index.duplicated(keep='last')]
         data = data.dropna()
-        if limit:
-            data = data.tail(limit)
         if not data.index.is_monotonic_increasing:
             data = data.sort_index()
-        KLINE_CACHE[cache_key] = data
         return data
     except Exception as e:
-        logger.error(f"数据加载错误：{e}")
+        logger.error(f"API 数据加载错误：{e}, 参数={params}")
         return pd.DataFrame()
 
-# Plotly 绘图函数
-def create_plotly_kline_plot(
-    data,
-    backtest_data,
-    buy_signals=None,
-    sell_signals=None,
-    indicator_data=None,
-    indicator_config=None,
-    xaxis_range=None,
-    show_volume=False
+# 数据重采样函数
+def resample_kline_data(data, target_interval):
+    if target_interval == '1m':
+        return data
+    interval_map = {'5m': '5min', '15m': '15min', '30m': '30min', '1h': '1h', '4h': '4h', '1D': '1D', '1W': '1W', '1M': '1M'}
+    if target_interval not in interval_map:
+        logger.error(f"不支持的周期：{target_interval}")
+        return data
+    resample_rule = interval_map[target_interval]
+    resampled_data = data.resample(resample_rule).agg({
+        'open': 'first', 'high': 'max', 'low': 'min', 'close': 'last', 'volume': 'sum'
+    }).dropna()
+    if len(resampled_data) < 300:
+        logger.warning(f"重采样后数据不足，周期={target_interval}，K线数量={len(resampled_data)}")
+    return resampled_data
+
+# 导出测试数据函数
+def export_test_data(output_path, coin_name='LEAUSDT', interval='1m', limit=2000):
+    try:
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        start_time = datetime.now() - timedelta(minutes=limit)
+        data = load_kline_data(coin_name, interval, start_timestamp=start_time, limit=limit)
+        if data.empty:
+            logger.error("无法加载测试数据，数据为空")
+            return
+        data.reset_index().to_csv(output_path, index=False)
+        logger.info(f"测试数据已导出到：{output_path}")
+    except Exception as e:
+        logger.error(f"导出测试数据失败：{e}")
+        return
+
+# 绘制 K 线图函数（带缓存）
+@lru_cache(maxsize=10)
+def create_plotly_kline_plot_cached(
+    data_tuple, backtest_data_tuple, buy_signals_tuple, sell_signals_tuple, indicator_data_tuple,
+    indicator_config_tuple, xaxis_range_tuple, show_volume, show_indicators, show_signals, cycle
 ):
+    try:
+        data = pd.DataFrame(data_tuple[0], columns=data_tuple[1], index=pd.to_datetime(data_tuple[2]))
+        backtest_data = pd.DataFrame(backtest_data_tuple[0], columns=backtest_data_tuple[1], index=pd.to_datetime(backtest_data_tuple[2]))
+        buy_signals = pd.read_json(StringIO(buy_signals_tuple)) if buy_signals_tuple else None
+        sell_signals = pd.read_json(StringIO(sell_signals_tuple)) if sell_signals_tuple else None
+        indicator_data = json.loads(indicator_data_tuple) if indicator_data_tuple else None
+        indicator_config = json.loads(indicator_config_tuple) if indicator_config_tuple else None
+        # 规范化时间范围精度（秒级）
+        xaxis_range = [pd.to_datetime(t).floor('s').isoformat() for t in xaxis_range_tuple] if xaxis_range_tuple else None
+        logger.debug(f"缓存绘图调用：xaxis_range={xaxis_range}, show_volume={show_volume}, cycle={cycle}")
+        return create_plotly_kline_plot(
+            data, backtest_data, buy_signals, sell_signals, indicator_data,
+            indicator_config, xaxis_range, show_volume, show_indicators, show_signals, cycle
+        )
+    except Exception as e:
+        logger.error(f"缓存绘图失败：{e}")
+        return go.Figure()
+
+# 绘制 K 线图函数
+def create_plotly_kline_plot(
+    data, backtest_data, buy_signals=None, sell_signals=None, indicator_data=None,
+    indicator_config=None, xaxis_range=None, show_volume=False, show_indicators=False,
+    show_signals=False, cycle='1m'
+):
+    start_time = time.time()
     if data.empty:
         logger.warning("无数据，无法绘图")
         fig = go.Figure()
         default_start = pd.to_datetime('2025-04-19 00:00:00')
         default_end = pd.to_datetime('2025-04-19 23:59:59')
         fig.update_layout(
-            xaxis_rangeslider_visible=False,
-            dragmode='pan',
-            template='plotly_dark',
-            hovermode='x unified',
-            showlegend=True,
-            height=600,
-            width=1200,
+            xaxis_rangeslider_visible=True, dragmode='pan', template='plotly_dark',
+            hovermode='x unified', showlegend=True, height=600, width=1200,
             xaxis=dict(
                 range=[default_start, default_end],
-                rangeselector=dict(
-                    buttons=[
-                        dict(count=1, label="1h", step="hour", stepmode="backward"),
-                        dict(count=1, label="1d", step="day", stepmode="backward"),
-                        dict(step="all", label="全部")
-                    ]
-                ),
-                type="date",
-                tickformat='%H:%M:%S'
+                rangeselector=dict(buttons=[
+                    dict(count=1, label="1h", step="hour", stepmode="backward"),
+                    dict(count=1, label="1d", step="day", stepmode="backward"),
+                    dict(step="all", label="全部")
+                ]),
+                type="date", tickformat='%H:%M:%S'
             )
         )
         return fig
-    
     if not isinstance(data.index, pd.DatetimeIndex):
-        logger.error(f"数据索引不是 DatetimeIndex：{data.index}")
         data.index = pd.to_datetime(data.index)
-
     if not data.index.is_monotonic_increasing:
         data = data.sort_index()
-
     required_columns = ['open', 'high', 'low', 'close', 'volume']
     missing_columns = [col for col in required_columns if col not in data.columns]
     if missing_columns:
         logger.error(f"数据缺少必要列：{missing_columns}")
         return go.Figure()
-    
-    for col in ['open', 'high', 'low', 'close']:
-        if not pd.to_numeric(data[col], errors='coerce').notnull().all():
-            logger.warning(f"原始数据列 {col} 包含 NaN 或非数值数据")
-            data = data.dropna(subset=[col])
-
-    if data.empty:
-        logger.warning("数据清洗后为空，使用默认数据")
-        default_data = pd.DataFrame({
-            'open': [0.0050],
-            'high': [0.0051],
-            'low': [0.0049],
-            'close': [0.0050],
-            'volume': [1000]
-        }, index=[pd.to_datetime('2025-04-19 12:07:00')])
-        data = default_data
-
+    # 设置时间轴范围
+    interval_minutes = {'1m': 1, '5m': 5, '15m': 15, '30m': 30, '1h': 60, '4h': 240, '1D': 1440, '1W': 10080, '1M': 43200}
+    display_candles = 300
     if xaxis_range:
         try:
-            range_start = pd.to_datetime(xaxis_range[0])
-            range_end = pd.to_datetime(xaxis_range[1])
+            range_start = pd.to_datetime(xaxis_range[0]).floor('s')
+            range_end = pd.to_datetime(xaxis_range[1]).floor('s')
             if range_start > range_end:
-                logger.warning(f"xaxis_range 无效，range_start ({range_start}) 晚于 range_end ({range_end})，交换两者")
                 range_start, range_end = range_end, range_start
                 xaxis_range = [range_start.isoformat(), range_end.isoformat()]
             if range_start < data.index.min():
                 range_start = data.index.min()
-                logger.warning(f"xaxis_range 开始时间早于数据范围，调整为：{range_start}")
             if range_end > data.index.max():
                 range_end = data.index.max()
-                logger.warning(f"xaxis_range 结束时间晚于数据范围，调整为：{range_end}")
         except Exception as e:
             logger.error(f"xaxis_range 转换失败：{xaxis_range}, 错误：{e}")
             range_start = data.index.min()
             range_end = data.index.max()
     else:
         range_end = data.index.max()
-        range_start = data.index[-300] if len(data) >= 300 else data.index.min()
-    
-    # 裁剪 K 线显示数据
-    display_data = data.loc[range_start:range_end]
-    if display_data.empty:
-        logger.warning(f"xaxis_range [{range_start}, {range_end}] 无数据，数据范围：{data.index.min()} 到 {data.index.max()}")
-        display_data = data  # 使用整个数据范围
-        range_start = data.index.min()
-        range_end = data.index.max()
-        xaxis_range = [range_start.isoformat(), range_end.isoformat()]
-    
-    for col in ['open', 'high', 'low', 'close']:
-        if not pd.to_numeric(display_data[col], errors='coerce').notnull().all():
-            logger.warning(f"裁剪后的 display_data 列 {col} 包含 NaN 或非数值数据")
-            display_data = display_data.dropna(subset=[col])
-
-    if display_data.empty:
-        logger.warning("裁剪后 display_data 为空，使用默认数据")
-        display_data = pd.DataFrame({
-            'open': [0.0050],
-            'high': [0.0051],
-            'low': [0.0049],
-            'close': [0.0050],
-            'volume': [1000]
-        }, index=[pd.to_datetime('2025-04-19 12:07:00')])
-        range_start = display_data.index.min()
-        range_end = display_data.index.max()
-        xaxis_range = [range_start.isoformat(), range_end.isoformat()]
-
-    # 动态确定子图数量和高度
-    rows = 1  # 至少有一个 K 线图
-    row_heights = [1.0]  # 默认只显示 K 线图
+        range_start = range_end - timedelta(minutes=display_candles * interval_minutes.get(cycle, 1))
+        if range_start < data.index.min():
+            range_start = data.index.min()
+    # 动态创建子图
+    rows = 1
+    row_heights = [1.0]
     subplot_titles = ['K线图']
-
     if show_volume:
         rows += 1
         row_heights = [0.7, 0.3] if rows == 2 else [0.5, 0.2, 0.3]
         subplot_titles.append('成交量')
-
-    if indicator_data:
+    if show_indicators and indicator_data:
         rows += 1
         row_heights = [0.5, 0.2, 0.3] if rows == 3 else [0.7, 0.3]
-        subplot_titles.append(indicator_data.get('name', 'Indicator'))
-    
+        subplot_titles.append('指标')
     fig = make_subplots(
-        rows=rows,
-        cols=1,
-        shared_xaxes=True,
-        vertical_spacing=0.03,
-        subplot_titles=subplot_titles,
-        row_heights=row_heights
+        rows=rows, cols=1, shared_xaxes=True, vertical_spacing=0.03,
+        subplot_titles=subplot_titles, row_heights=row_heights
     )
-    
-    # 添加 K 线图
+    # 绘制 K 线图
     fig.add_trace(
         go.Candlestick(
-            x=display_data.index,
-            open=display_data['open'],
-            high=display_data['high'],
-            low=display_data['low'],
-            close=display_data['close'],
-            name='K线'
+            x=data.index, open=data['open'], high=data['high'],
+            low=data['low'], close=data['close'], name='K线'
         ),
-        row=1,
-        col=1
+        row=1, col=1
     )
-    
-    # 添加买卖点（基于 backtest_data，但仅显示在 xaxis_range 范围内）
-    if buy_signals is not None and not buy_signals.empty:
-        buy_signals_filtered = buy_signals[buy_signals['EntryTime'].between(range_start, range_end)]
-        if not buy_signals_filtered.empty:
-            fig.add_trace(
-                go.Scatter(
-                    x=buy_signals_filtered['EntryTime'],
-                    y=buy_signals_filtered['EntryPrice'],
-                    mode='markers',
-                    name='买入',
-                    marker=dict(symbol='triangle-up', size=10, color='green'),
-                    text=[f"买入价格: {price:.2f}" for price in buy_signals_filtered['EntryPrice']],
-                    hoverinfo='text+x'
-                ),
-                row=1,
-                col=1
-            )
-    if sell_signals is not None and not sell_signals.empty:
-        sell_signals_filtered = sell_signals[sell_signals['EntryTime'].between(range_start, range_end)]
-        if not sell_signals_filtered.empty:
-            fig.add_trace(
-                go.Scatter(
-                    x=sell_signals_filtered['EntryTime'],
-                    y=sell_signals_filtered['EntryPrice'],
-                    mode='markers',
-                    name='卖出',
-                    marker=dict(symbol='triangle-down', size=10, color='red'),
-                    text=[f"卖出价格: {price:.2f}" for price in sell_signals_filtered['EntryPrice']],
-                    hoverinfo='text+x'
-                ),
-                row=1,
-                col=1
-            )
-    
-    # 添加成交量（基于 display_data）
+    # 绘制买卖信号
+    if show_signals and buy_signals is not None and not buy_signals.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=buy_signals['EntryTime'], y=buy_signals['EntryPrice'],
+                mode='markers', name='买入', marker=dict(symbol='triangle-up', size=10, color='green'),
+                text=[f"买入价格: {price:.2f}" for price in buy_signals['EntryPrice']],
+                hoverinfo='text+x'
+            ),
+            row=1, col=1
+        )
+    if show_signals and sell_signals is not None and not sell_signals.empty:
+        fig.add_trace(
+            go.Scatter(
+                x=sell_signals['EntryTime'], y=sell_signals['EntryPrice'],
+                mode='markers', name='卖出', marker=dict(symbol='triangle-down', size=10, color='red'),
+                text=[f"卖出价格: {price:.2f}" for price in sell_signals['EntryPrice']],
+                hoverinfo='text+x'
+            ),
+            row=1, col=1
+        )
+    # 绘制成交量
     if show_volume:
         fig.add_trace(
             go.Bar(
-                x=display_data.index,
-                y=display_data['volume'],
-                name='成交量',
-                marker_color='blue'
+                x=data.index, y=data['volume'], name='成交量', marker_color='blue'
             ),
-            row=2 if not indicator_data else 2,
+            row=2 if not (show_indicators and indicator_data) else 2,
             col=1
         )
-    
-    # 添加指标（基于 backtest_data，但仅显示在 xaxis_range 范围内）
-    if indicator_data and 'values' in indicator_data:
-        indicator_series = pd.Series(indicator_data['values'], index=backtest_data.index)
-        indicator_series_filtered = indicator_series.loc[range_start:range_end]
-        if indicator_series_filtered.empty:
-            # 如果指标数据为空，使用整个 backtest_data 的指标数据，并在图表上显示提示
-            indicator_series_filtered = indicator_series
-            fig.add_annotation(
-                text="指标数据超出当前时间范围，请调整时间区间",
-                xref="paper",
-                yref="paper",
-                x=0.5,
-                y=0.5,
-                showarrow=False,
-                font=dict(size=14, color="red"),
-                align="center",
-                bordercolor="red",
-                borderwidth=2,
-                borderpad=4,
-                bgcolor="rgba(255, 255, 255, 0.8)"
-            )
-        fig.add_trace(
-            go.Scatter(
-                x=indicator_series_filtered.index,
-                y=indicator_series_filtered,
-                name=indicator_data.get('name', 'Indicator'),
-                line=dict(color='purple')
-            ),
-            row=3 if show_volume else 2,
-            col=1
-        )
-        if indicator_config:
-            for shape in indicator_config.get('shapes', []):
-                fig.add_shape(
-                    type='line',
-                    x0=max(range_start, indicator_series_filtered.index.min()),
-                    x1=min(range_end, indicator_series_filtered.index.max()),
-                    y0=shape['y'],
-                    y1=shape['y'],
-                    line=dict(color=shape.get('color', 'gray'), dash=shape.get('dash', 'dash')),
-                    row=3 if show_volume else 2,
-                    col=1
+    # 绘制指标（支持多策略）
+    if show_indicators and indicator_data:
+        for idx, ind_data in enumerate(indicator_data):
+            if ind_data and 'values' in ind_data and len(ind_data['values']) > 0:
+                indicator_series = pd.Series(ind_data['values'], index=backtest_data.index)
+                fig.add_trace(
+                    go.Scatter(
+                        x=indicator_series.index, y=indicator_series,
+                        name=ind_data.get('name', f'Indicator_{idx}'), line=dict(color='purple')
+                    ),
+                    row=3 if show_volume else 2, col=1
                 )
-    
-    # 强制设置时间轴范围
-    actual_start = display_data.index.min()
-    actual_end = display_data.index.max()
+                if indicator_config and idx < len(indicator_config):
+                    for shape in indicator_config[idx].get('shapes', []):
+                        fig.add_shape(
+                            type='line', x0=data.index.min(), x1=data.index.max(),
+                            y0=shape['y'], y1=shape['y'],
+                            line=dict(color=shape.get('color', 'gray'), dash=shape.get('dash', 'dash')),
+                            row=3 if show_volume else 2, col=1
+                        )
+    # 设置动态时间轴刻度
+    interval_map = {
+        '1m': {'tickformat': '%H:%M:%S', 'base_dtick': 1800000},
+        '5m': {'tickformat': '%H:%M', 'base_dtick': 300000},
+        '15m': {'tickformat': '%H:%M', 'base_dtick': 900000},
+        '30m': {'tickformat': '%H:%M', 'base_dtick': 1800000},
+        '1h': {'tickformat': '%m-%d %H:%M', 'base_dtick': 3600000 * 4},
+        '4h': {'tickformat': '%m-%d %H:%M', 'base_dtick': 3600000 * 12},
+        '1D': {'tickformat': '%Y-%m-%d', 'base_dtick': 86400000},
+        '1W': {'tickformat': '%Y-%m-%d', 'base_dtick': 86400000 * 7},
+        '1M': {'tickformat': '%Y-%m', 'base_dtick': 86400000 * 30}
+    }
+    time_span = (range_end - range_start).total_seconds() / 60
+    candle_count = time_span / interval_minutes.get(cycle, 1)
+    target_ticks = 15
+    base_dtick = interval_map.get(cycle, {'base_dtick': 1800000})['base_dtick']
+    adjusted_dtick = base_dtick * (candle_count // target_ticks) if candle_count > target_ticks else base_dtick
     xaxis_layout = dict(
-        range=[actual_start, actual_end],
-        rangeselector=dict(
-            buttons=[
-                dict(count=1, label="1h", step="hour", stepmode="backward"),
-                dict(count=1, label="1d", step="day", stepmode="backward"),
-                dict(step="all", label="全部")
-            ]
-        ),
+        range=[range_start, range_end],
+        rangeselector=dict(buttons=[
+            dict(count=1, label="1h", step="hour", stepmode="backward"),
+            dict(count=1, label="1d", step="day", stepmode="backward"),
+            dict(step="all", label="全部")
+        ]),
         type="date",
-        tickformat='%H:%M:%S',
-        dtick=1800000
+        tickformat=interval_map.get(cycle, {'tickformat': '%H:%M:%S'})['tickformat'],
+        dtick=adjusted_dtick
     )
-    
     fig.update_layout(
-        xaxis_rangeslider_visible=False,
-        dragmode='pan',
-        template='plotly_dark',
-        hovermode='x unified',
-        showlegend=True,
-        height=800 if indicator_data else 600,
-        width=1200,
+        xaxis_rangeslider_visible=True, xaxis_rangeslider=dict(range=[range_start, range_end]),
+        dragmode='pan', template='plotly_dark', hovermode='x unified',
+        showlegend=True, height=800 if show_indicators else 600, width=1200,
         xaxis=xaxis_layout
     )
-    
     for i in range(2, rows + 1):
         fig.update_layout(**{f'xaxis{i}': xaxis_layout})
-
+    logger.info(f"图表渲染耗时：{time.time() - start_time:.2f}秒")
     return fig
 
-# Dash 应用
-app = Dash(__name__, external_stylesheets=[dbc.themes.DARKLY], suppress_callback_exceptions=True)
+# 初始化 Dash 应用
+app = Dash(__name__, external_stylesheets=[dbc.themes.DARKLY, 'assets/custom.css'], suppress_callback_exceptions=True)
 
-# 数据库路径
-DB_PATH = r'D:\策略研究\kline_db_new\kline_data_LEAUSDT.db'
+# 检查 API 健康状态
+if not check_api_health():
+    logger.warning("API 不可用，可能会影响数据加载")
 
-# 时间范围
-MIN_DATE, MAX_DATE = get_db_time_range(DB_PATH)
-DEFAULT_END_DATE = MAX_DATE
-DEFAULT_START_DATE = DEFAULT_END_DATE - timedelta(minutes=300)
+# 设置时间范围
+MIN_DATE, MAX_DATE = get_api_time_range()
+# 从最早时间开始加载数据
+DEFAULT_START_DATE = MIN_DATE.replace(second=0, microsecond=0)  # 精确到分钟
+DEFAULT_END_DATE = (DEFAULT_START_DATE + timedelta(minutes=2000)).replace(second=0, microsecond=0)
 
-# 初始数据
+# 加载初始数据（从最早时间开始加载）
 KLINE_CACHE = {}
-initial_data = load_kline_data(DB_PATH, start_timestamp=DEFAULT_START_DATE, end_timestamp=DEFAULT_END_DATE, limit=300)
-if initial_data.empty:
+all_data = None
+attempts = 0
+max_attempts = 5
+current_start_date = DEFAULT_START_DATE
+while attempts < max_attempts:
+    logger.info(f"尝试加载初始数据，尝试次数：{attempts + 1}，开始时间：{current_start_date}")
+    all_data = load_and_resample_data(current_start_date, '1m')
+    if not all_data.empty:
+        break
+    attempts += 1
+    current_start_date += timedelta(days=1)  # 向前尝试一天
+
+if all_data.empty:
     logger.error("初始数据加载失败，使用空数据")
-    initial_data = pd.DataFrame(columns=['open', 'high', 'low', 'close', 'volume'])
-initial_data.index = pd.to_datetime(initial_data.index)
-initial_data.index.name = 'timestamp'
+    all_data = pd.DataFrame(columns=['open', 'high', 'low', 'close', 'volume'])
+all_data.index = pd.to_datetime(all_data.index)
+all_data.index.name = 'timestamp'
 
-# 设置 xaxis-range 初始值
-initial_xaxis_range = [initial_data.index.min().isoformat(), initial_data.index.max().isoformat()] if not initial_data.empty else [DEFAULT_START_DATE.isoformat(), DEFAULT_END_DATE.isoformat()]
+# 设置初始时间轴范围（最新的 300 根 K 线）
+if not all_data.empty:
+    initial_end = all_data.index.max()
+    initial_start = all_data.index[-300] if len(all_data) >= 300 else all_data.index.min()
+    initial_xaxis_range = [initial_start.isoformat(), initial_end.isoformat()]
+else:
+    initial_xaxis_range = [DEFAULT_START_DATE.isoformat(), min(DEFAULT_END_DATE, MAX_DATE).isoformat()]
 
-initial_plotly_fig = create_plotly_kline_plot(initial_data, initial_data, xaxis_range=initial_xaxis_range, show_volume=False)
-initial_lwc_data = {
-    'candlestick': initial_data.reset_index().rename(columns={'timestamp': 'time'})[['time', 'open', 'high', 'low', 'close']]
-        .assign(time=lambda x: x['time'].apply(lambda t: t.isoformat()))
-        .to_dict('records'),
-    'volume': initial_data.reset_index().rename(columns={'timestamp': 'time', 'volume': 'value'})[['time', 'value']]
-        .assign(time=lambda x: x['time'].apply(lambda t: t.isoformat()), color='rgba(0, 150, 255, 0.5)')
-        .to_dict('records'),
-    'indicator': None,
-    'buy_signals': [],
-    'sell_signals': [],
-    'xaxis_range': initial_xaxis_range
-}
+# 创建初始图表
+initial_plotly_fig = create_plotly_kline_plot(
+    all_data, all_data, xaxis_range=initial_xaxis_range,
+    show_volume=True, show_indicators=False, show_signals=False, cycle='1m'
+)
 
-# 回测缓存
+# 初始化回测缓存
 BACKTEST_CACHE = {}
 
-# 布局
+# 定义 Dash 应用布局
 app.layout = dbc.Container([
     html.H1('LEAUSDT 策略回测', style={'textAlign': 'center', 'color': 'white'}),
     dbc.Row([
+        # 左侧控制面板
         dbc.Col([
-            html.Label('选择策略', style={'color': 'white'}),
+            html.Label('选择策略（可多选）', style={'color': 'white'}),
             dcc.Dropdown(
                 id='strategy-select',
                 options=[{'label': STRATEGIES[k]['display_name'], 'value': k} for k in STRATEGIES.keys()],
-                value=None,
+                value=None, multi=True,
                 placeholder='请选择策略',
                 style={'backgroundColor': '#333', 'color': 'white', 'borderColor': '#555'}
             ),
@@ -458,38 +497,76 @@ app.layout = dbc.Container([
                 max_date_allowed=MAX_DATE,
                 start_date=DEFAULT_START_DATE,
                 end_date=DEFAULT_END_DATE,
+                display_format='YYYY-MM-DD HH:mm',  # 显示小时和分钟
                 style={'backgroundColor': '#333', 'color': 'white', 'borderColor': '#555'}
             ),
             html.Br(),
-            html.Label('图表类型', style={'color': 'white'}),
-            dcc.Dropdown(
-                id='chart-type',
-                options=[
-                    {'label': 'Plotly', 'value': 'plotly'},
-                    {'label': 'Lightweight Charts', 'value': 'lwc'}
-                ],
-                value='plotly',
-                style={'backgroundColor': '#333', 'color': 'white', 'borderColor': '#555'}
-            ),
-            html.Br(),
-            html.Label('显示成交量', style={'color': 'white'}),
+            html.Label('图层显示', style={'color': 'white'}),
             dcc.Checklist(
-                id='show-volume',
-                options=[{'label': '显示成交量', 'value': 'volume'}],
-                value=['volume'],
+                id='layer-select',
+                options=[
+                    {'label': '显示成交量', 'value': 'volume'},
+                    {'label': '显示指标', 'value': 'indicators'},
+                    {'label': '显示买卖点', 'value': 'signals'}
+                ],
+                value=['volume', 'indicators', 'signals'],
                 style={'color': 'white'}
             ),
             html.Br(),
             html.Label('加载历史数据', style={'color': 'white'}),
             dbc.Button('加载更多', id='load-more', color='secondary', n_clicks=0),
+            html.Br(),
+            html.Label('添加标注', style={'color': 'white'}),
+            dcc.Input(id='annotation-time', type='text', placeholder='时间 (YYYY-MM-DD HH:MM:SS)', style={'width': '100%', 'marginBottom': '5px'}),
+            dcc.Input(id='annotation-text', type='text', placeholder='标注文本', style={'width': '100%', 'marginBottom': '5px'}),
+            dbc.Button('添加垂直线', id='add-annotation', color='primary', n_clicks=0),
             html.Div(id='strategy-params', style={'color': 'white'}),
         ], width=3),
+        # 右侧图表和结果区域
         dbc.Col([
-            dcc.Loading(id='loading', children=[
-                html.Div(id='chart-container', children=[
-                    dcc.Graph(id='plotly-kline-plot', figure=initial_plotly_fig, config={'scrollZoom': True, 'doubleClick': 'reset'})
-                ])
-            ]),
+            html.Div(
+                style={'position': 'relative'},
+                children=[
+                    html.Div(
+                        children=[
+                            html.Label('选择周期', style={'color': 'white', 'marginRight': '10px'}),
+                            dcc.Dropdown(
+                                id='cycle-select',
+                                options=[
+                                    {'label': '1分钟 (1m)', 'value': '1m'}, {'label': '5分钟 (5m)', 'value': '5m'},
+                                    {'label': '15分钟 (15m)', 'value': '15m'}, {'label': '30分钟 (30m)', 'value': '30m'},
+                                    {'label': '1小时 (1h)', 'value': '1h'}, {'label': '4小时 (4h)', 'value': '4h'},
+                                    {'label': '1天 (1D)', 'value': '1D'}, {'label': '1周 (1W)', 'value': '1W'},
+                                    {'label': '1月 (1M)', 'value': '1M'}
+                                ],
+                                value='1m',
+                                className='cycle-dropdown',
+                                style={
+                                    'backgroundColor': '#ffffff',
+                                    'color': '#000000',
+                                    'borderColor': '#000000',
+                                    'width': '150px',
+                                    'display': 'inline-block',
+                                    'verticalAlign': 'middle'
+                                }
+                            ),
+                        ],
+                        style={
+                            'position': 'absolute',
+                            'top': '10px',
+                            'left': '10px',
+                            'zIndex': 1000,
+                            'display': 'flex',
+                            'alignItems': 'center'
+                        }
+                    ),
+                    dcc.Loading(id='loading', children=[
+                        html.Div(id='chart-container', children=[
+                            dcc.Graph(id='plotly-kline-plot', figure=initial_plotly_fig, config={'scrollZoom': True, 'doubleClick': 'reset'})
+                        ])
+                    ]),
+                ]
+            ),
             html.Div(id='stats-output', style={'color': 'white'}),
             html.Br(),
             html.Label('交易详情', style={'color': 'white'}),
@@ -499,6 +576,7 @@ app.layout = dbc.Container([
                     {'name': '时间', 'id': 'EntryTime'},
                     {'name': '类型', 'id': 'Type'},
                     {'name': '价格', 'id': 'EntryPrice'},
+                    {'name': '策略', 'id': 'Strategy'}
                 ],
                 data=[],
                 style_table={'overflowX': 'auto'},
@@ -508,302 +586,368 @@ app.layout = dbc.Container([
             )
         ], width=9)
     ]),
-    dcc.Store(id='data-store', data=initial_data.to_json(date_format='iso', orient='split')),
-    dcc.Store(id='backtest-data-store', data=initial_data.to_json(date_format='iso', orient='split')),
-    dcc.Store(id='lwc-data-store', data=json.dumps(initial_lwc_data)),
+    dcc.Store(id='data-store', data=all_data.to_json(date_format='iso', orient='split')),
+    dcc.Store(id='backtest-data-store', data=all_data.to_json(date_format='iso', orient='split')),
     dcc.Store(id='xaxis-range', data=initial_xaxis_range),
-    dcc.Store(id='backtest-results', data=json.dumps({})),
+    dcc.Store(id='backtest-results', data=json.dumps([])),
+    dcc.Store(id='annotations', data=[]),
 ], fluid=True)
 
-# 参数输入和数据加载
+# 回调函数：更新时间轴范围
+@app.callback(
+    Output('xaxis-range', 'data'),
+    Input('plotly-kline-plot', 'relayoutData'),
+    State('xaxis-range', 'data'),
+    prevent_initial_call=True
+)
+def update_xaxis_range(relayout_data, current_range):
+    last_update_time = getattr(update_xaxis_range, '_last_update_time', 0)
+    current_time = time.time()
+    if current_time - last_update_time < 1.5:
+        logger.debug("时间轴更新被节流")
+        return no_update
+    update_xaxis_range._last_update_time = current_time
+
+    if not relayout_data or not isinstance(relayout_data, dict) or ('xaxis.range[0]' not in relayout_data and 'xaxis.range[1]' not in relayout_data):
+        logger.debug("无效的 relayoutData，跳过更新")
+        return no_update
+
+    try:
+        range_start = pd.to_datetime(relayout_data.get('xaxis.range[0]', current_range[0])).floor('s')
+        range_end = pd.to_datetime(relayout_data.get('xaxis.range[1]', current_range[1])).floor('s')
+        if range_start > range_end:
+            range_start, range_end = range_end, range_start
+        if range_start < MIN_DATE:
+            range_start = MIN_DATE
+        if range_end > MAX_DATE:
+            range_end = MAX_DATE
+        new_range = [range_start.isoformat(), range_end.isoformat()]
+        # 检查时间跨度变化
+        current_span = (pd.to_datetime(current_range[1]) - pd.to_datetime(current_range[0])).total_seconds()
+        new_span = (range_end - range_start).total_seconds()
+        if abs(new_span - current_span) / current_span < 0.1 and abs(new_span - current_span) < 60:  # 小于10%且小于1分钟
+            logger.debug("时间跨度变化过小，跳过更新")
+            return no_update
+        logger.debug(f"更新时间轴范围：{new_range}")
+        return new_range
+    except Exception as e:
+        logger.error(f"relayoutData xaxis_range 转换失败：{relayout_data}, 错误：{e}")
+        return no_update
+
+# 回调函数：加载更多数据
+@app.callback(
+    [Output('data-store', 'data', allow_duplicate=True),
+     Output('backtest-data-store', 'data', allow_duplicate=True)],
+    [Input('xaxis-range', 'data'),
+     Input('cycle-select', 'value')],
+    [State('data-store', 'data'),
+     State('backtest-data-store', 'data')],
+    prevent_initial_call=True
+)
+def load_more_data(xaxis_range, cycle, stored_data, backtest_data):
+    global all_data
+    # 节流控制
+    last_load_time = getattr(load_more_data, '_last_load_time', 0)
+    current_time = time.time()
+    if current_time - last_load_time < 1.0:
+        logger.debug("数据加载被节流")
+        return no_update, no_update
+    load_more_data._last_load_time = current_time
+
+    # 反序列化数据
+    try:
+        all_data = pd.read_json(StringIO(stored_data), orient='split')
+        all_data.index = pd.to_datetime(all_data.index)
+        all_data.index.name = 'timestamp'
+    except Exception as e:
+        logger.error(f"数据反序列化失败：{e}")
+        return no_update, no_update
+
+    # 检查时间范围和 K 线数量
+    range_start = pd.to_datetime(xaxis_range[0]).floor('s')
+    range_end = pd.to_datetime(xaxis_range[1]).floor('s')
+    interval_minutes = {'1m': 1, '5m': 5, '15m': 15, '30m': 30, '1h': 60, '4h': 240, '1D': 1440, '1W': 10080, '1M': 43200}
+    cycle_minutes = interval_minutes.get(cycle, 1)
+    
+    # 计算当前范围内的 K 线数量
+    visible_data = all_data[(all_data.index >= range_start) & (all_data.index <= range_end)]
+    visible_candles = len(visible_data)
+    logger.debug(f"当前可见 K 线数量：{visible_candles}, 范围：{range_start} 至 {range_end}, 数据边界：{all_data.index.min()} 至 {all_data.index.max()}")
+
+    # 检查是否需要加载更多数据（左边界）
+    data_updated = False
+    if (visible_candles < 300 or range_start < all_data.index.min()) and range_start > MIN_DATE:
+        load_candles_1m = 300 if cycle == '1m' else 300 * (cycle_minutes // interval_minutes['1m'])
+        load_minutes = load_candles_1m * interval_minutes['1m']
+        load_end = max(all_data.index.min(), range_start)
+        load_start = load_end - timedelta(minutes=load_minutes)
+        if load_start < MIN_DATE:
+            load_start = MIN_DATE
+        logger.info(f"加载历史数据：开始时间={load_start}, 周期={cycle}, 加载 1m K 线数量={load_candles_1m}")
+        new_data = load_kline_data('LEAUSDT', '1m', start_timestamp=load_start, limit=load_candles_1m)
+        if new_data is not None and not new_data.empty:
+            all_data = pd.concat([new_data, all_data]).sort_index()
+            all_data = all_data[~all_data.index.duplicated(keep='last')]
+            all_data = resample_kline_data(all_data, cycle)
+            data_updated = True
+            logger.info(f"加载新数据成功，新增 K 线数量：{len(new_data)}")
+        else:
+            logger.warning(f"未加载到新数据：开始时间={load_start}")
+
+    if not data_updated:
+        return no_update, no_update
+
+    return all_data.to_json(date_format='iso', orient='split'), all_data.to_json(date_format='iso', orient='split')
+
+# 回调函数：更新参数和数据
 @app.callback(
     [Output('strategy-params', 'children'),
-     Output('data-store', 'data'),
-     Output('backtest-data-store', 'data'),
-     Output('lwc-data-store', 'data'),
+     Output('data-store', 'data', allow_duplicate=True),
+     Output('backtest-data-store', 'data', allow_duplicate=True),
      Output('backtest-results', 'data')],
-    [Input('strategy-select', 'value'),
+    [Input('cycle-select', 'value'),
+     Input('strategy-select', 'value'),
      Input('date-range', 'start_date'),
      Input('date-range', 'end_date'),
-     Input({'type': 'param', 'index': dash.ALL}, 'value'),
-     Input('xaxis-range', 'data')],
+     Input({'type': 'param', 'index': dash.ALL}, 'value')],
     [State('data-store', 'data'),
      State('backtest-data-store', 'data'),
      State('strategy-params', 'children')],
     prevent_initial_call=True
 )
-def update_params_and_data(strategy, start_date, end_date, param_values, xaxis_range, stored_data, backtest_data, param_children):
-    # 加载显示数据（基于 xaxis-range）
-    display_data = pd.read_json(StringIO(stored_data), orient='split')
-    display_data.index = pd.to_datetime(display_data.index)
-
-    # 确保 start_date 不晚于 end_date
-    start_time = pd.to_datetime(start_date)
-    end_time = pd.to_datetime(end_date)
+def update_params_and_data(cycle, strategies, start_date, end_date, param_values, stored_data, backtest_data, param_children):
+    global all_data
+    start_time = pd.to_datetime(start_date).floor('s')
+    end_time = pd.to_datetime(end_date).floor('s')
     if start_time > end_time:
         logger.warning(f"start_date ({start_time}) 晚于 end_date ({end_time})，交换两者")
         start_time, end_time = end_time, start_time
-
-    # 加载回测数据（基于 date-range）
-    backtest_start = start_time - timedelta(minutes=300)  # 额外加载前 300 分钟数据以确保指标计算
-    backtest_end = end_time
-    backtest_data = load_kline_data(DB_PATH, start_timestamp=backtest_start, end_timestamp=backtest_end, limit=5000)
-    if backtest_data.empty:
-        logger.warning("回测数据加载失败，使用现有数据")
-        backtest_data = pd.read_json(StringIO(stored_data), orient='split')
-        backtest_data.index = pd.to_datetime(backtest_data.index)
-
-    # 加载显示数据（基于 xaxis-range，不随 date-range 变化）
-    if xaxis_range:
-        try:
-            range_start = pd.to_datetime(xaxis_range[0])
-            range_end = pd.to_datetime(xaxis_range[1])
-            if range_start > range_end:
-                logger.warning(f"xaxis_range 无效，range_start ({range_start}) 晚于 range_end ({range_end})，交换两者")
-                range_start, range_end = range_end, range_start
-        except Exception as e:
-            logger.error(f"xaxis_range 转换失败：{xaxis_range}, 错误：{e}")
-            range_start = display_data.index.min()
-            range_end = display_data.index.max()
-    else:
-        range_start = display_data.index[-300] if len(display_data) >= 300 else display_data.index.min()
-        range_end = display_data.index.max()
-
-    # 确保 display_data 覆盖 xaxis_range
-    display_start = range_start - timedelta(minutes=300)
-    display_end = range_end + timedelta(minutes=300)
-    display_data = load_kline_data(DB_PATH, start_timestamp=display_start, end_timestamp=display_end, limit=5000)
-    if display_data.empty:
-        logger.warning("显示数据加载失败，使用现有数据")
-        display_data = pd.read_json(StringIO(stored_data), orient='split')
-        display_data.index = pd.to_datetime(display_data.index)
-
-    # 确保索引名称为 timestamp
+    display_data = load_and_resample_data(start_time, cycle)
+    backtest_data = display_data.copy()
+    all_data = display_data.copy()
     display_data.index.name = 'timestamp'
     backtest_data.index.name = 'timestamp'
-
-    # 准备 Lightweight Charts 数据
-    data_reset = display_data.reset_index().rename(columns={'timestamp': 'time'})
-    lwc_data = {
-        'candlestick': data_reset[['time', 'open', 'high', 'low', 'close']]
-            .assign(time=lambda x: x['time'].apply(lambda t: t.isoformat()))
-            .to_dict('records'),
-        'volume': data_reset.rename(columns={'volume': 'value'})[['time', 'value']]
-            .assign(time=lambda x: x['time'].apply(lambda t: t.isoformat()), color='rgba(0, 150, 255, 0.5)')
-            .to_dict('records'),
-        'indicator': None,
-        'buy_signals': [],
-        'sell_signals': [],
-        'xaxis_range': [range_start.isoformat(), range_end.isoformat()]
-    }
-    
     inputs = []
-    if strategy and strategy in STRATEGIES:
-        param_schema = STRATEGIES[strategy]['param_schema']
-        for param, schema in param_schema.items():
-            if param == 'size':
-                continue
-            input_type = 'number' if schema['type'] in ['integer', 'float'] else 'text'
-            inputs.extend([
-                html.Label(f"{param.capitalize()} ({schema['description']})", style={'color': 'white', 'marginTop': '10px'}),
-                dcc.Input(
-                    id={'type': 'param', 'index': param},
-                    type=input_type,
-                    value=schema['default'],
-                    min=schema.get('min', None),
-                    max=schema.get('max', None),
-                    step=0.1 if schema['type'] == 'float' else 1,
-                    debounce=True,
-                    style={'backgroundColor': '#333', 'color': 'white', 'borderColor': '#555', 'width': '100%'}
-                )
-            ])
-
-    # 计算回测结果，基于 backtest_data
-    backtest_results = {}
-    params = {}
+    params_dict = {}
+    if strategies:
+        for strategy in strategies:
+            if strategy in STRATEGIES:
+                param_schema = STRATEGIES[strategy]['param_schema']
+                for param, schema in param_schema.items():
+                    if param == 'size':
+                        continue
+                    input_type = 'number' if schema['type'] in ['integer', 'float'] else 'text'
+                    inputs.extend([
+                        html.Label(f"{strategy}: {param.capitalize()} ({schema['description']})", style={'color': 'white', 'marginTop': '10px'}),
+                        dcc.Input(
+                            id={'type': 'param', 'index': f"{strategy}_{param}"},
+                            type=input_type, value=schema['default'],
+                            min=schema.get('min', None), max=schema.get('max', None),
+                            step=0.1 if schema['type'] == 'float' else 1,
+                            debounce=True,
+                            style={'backgroundColor': '#333', 'color': 'white', 'borderColor': '#555', 'width': '100%'}
+                        )
+                    ])
     if param_children:
         param_names = []
         for child in param_children[::2]:
-            label_content = child['props']['children']
-            if isinstance(label_content, str):
-                param_name = label_content.split(' (')[0].lower()
-            else:
-                try:
-                    param_name = label_content[0]['props']['children'].split(' (')[0].lower()
-                except (TypeError, IndexError, KeyError) as e:
-                    logger.error(f"无法提取参数名，child: {child}, 错误: {e}")
-                    param_name = ''
-            param_names.append(param_name)
-        
+            try:
+                label_content = child['props']['children']
+                strategy_name, param_desc = label_content.split(': ', 1)
+                param_name = param_desc.split(' (')[0].lower()
+                param_key = f"{strategy_name}_{param_name}"
+                param_names.append(param_key)
+            except Exception as e:
+                logger.error(f"解析参数标签失败：{label_content}, 错误：{e}")
+                continue
         for name, value in zip(param_names, param_values):
             if name and value is not None:
-                params[name] = value
-    if strategy:
-        params['size'] = STRATEGIES[strategy]['params'].get('size', 0.1)
-
-        strategy_instance = STRATEGIES[strategy]['class']()
-        cache_key = f"{strategy}_{hash(str(params))}_{hash(str(backtest_data.index[0]))}_{hash(str(backtest_data.index[-1]))}"
-        if cache_key in BACKTEST_CACHE:
-            stats, buy_signals, sell_signals = BACKTEST_CACHE[cache_key]
-        else:
+                try:
+                    strategy, param = name.split('_', 1)
+                    schema = STRATEGIES[strategy]['param_schema'][param]
+                    if schema['type'] == 'integer':
+                        params_dict.setdefault(strategy, {})[param] = int(value)
+                    elif schema['type'] == 'float':
+                        params_dict.setdefault(strategy, {})[param] = float(value)
+                    else:
+                        params_dict.setdefault(strategy, {})[param] = value
+                except (ValueError, KeyError) as e:
+                    logger.error(f"参数 {name} 转换失败：{value}, 错误：{e}")
+                    try:
+                        strategy, param = name.split('_', 1)
+                        params_dict.setdefault(strategy, {})[param] = STRATEGIES[strategy]['param_schema'][param]['default']
+                    except Exception as inner_e:
+                        logger.error(f"参数默认值设置失败：{inner_e}, 策略={strategy}, 参数={param}")
+    backtest_results = []
+    if strategies:
+        for strategy in strategies:
+            params = params_dict.get(strategy, {})
+            params['size'] = STRATEGIES[strategy]['params'].get('size', 0.1)
+            strategy_instance = STRATEGIES[strategy]['class']()
+            # 根据回测时间范围和周期加载数据
+            interval_minutes = {'1m': 1, '5m': 5, '15m': 15, '30m': 30, '1h': 60, '4h': 240, '1D': 1440, '1W': 10080, '1M': 43200}
+            cycle_minutes = interval_minutes.get(cycle, 1)
+            required_1m_candles = int((end_time - start_time).total_seconds() / 60 / interval_minutes['1m'])
+            load_start = start_time
+            backtest_1m_data = load_kline_data('LEAUSDT', '1m', start_timestamp=load_start, limit=required_1m_candles)
+            if backtest_1m_data.empty:
+                logger.error(f"回测数据加载失败：开始时间={load_start}")
+                backtest_1m_data = pd.DataFrame(columns=['open', 'high', 'low', 'close', 'volume'])
+            backtest_data_cycle = resample_kline_data(backtest_1m_data, cycle)
+            cache_key = f"{strategy}_{hash(str(params))}_{hash(str(backtest_data_cycle.index[0]))}_{hash(str(backtest_data_cycle.index[-1]))}"
+            if cache_key in BACKTEST_CACHE:
+                stats, buy_signals, sell_signals = BACKTEST_CACHE[cache_key]
+            else:
+                try:
+                    stats, buy_signals, sell_signals = strategy_instance.run_backtest(backtest_data_cycle, params)
+                    if not buy_signals.empty and 'EntryTime' in buy_signals.columns:
+                        buy_signals = buy_signals[buy_signals['EntryTime'].between(start_time, end_time)]
+                    if not sell_signals.empty and 'EntryTime' in sell_signals.columns:
+                        sell_signals = sell_signals[sell_signals['EntryTime'].between(start_time, end_time)]
+                    BACKTEST_CACHE[cache_key] = (stats, buy_signals, sell_signals)
+                except Exception as e:
+                    logger.error(f"回测失败（{strategy}）：{e}")
+                    stats, buy_signals, sell_signals = None, pd.DataFrame(), pd.DataFrame()
+            indicator_data = None
+            indicator_config = {}
             try:
-                stats, buy_signals, sell_signals = strategy_instance.run_backtest(backtest_data, params)
-                # 过滤买卖点，仅保留 date-range 内的交易
-                if not buy_signals.empty and 'EntryTime' in buy_signals.columns:
-                    buy_signals = buy_signals[buy_signals['EntryTime'].between(start_time, end_time)]
-                if not sell_signals.empty and 'EntryTime' in sell_signals.columns:
-                    sell_signals = sell_signals[sell_signals['EntryTime'].between(start_time, end_time)]
-                BACKTEST_CACHE[cache_key] = (stats, buy_signals, sell_signals)
+                values = strategy_instance.compute_indicator(backtest_data_cycle, params)
+                if values is not None:
+                    indicator_series = pd.Series(values, index=backtest_data_cycle.index, name=strategy.upper())
+                    indicator_df = indicator_series.reset_index()
+                    indicator_data = {
+                        'name': strategy.upper(),
+                        'values': indicator_df[strategy.upper()].values.tolist()
+                    }
+                    indicator_config = strategy_instance.indicator_config(backtest_data_cycle, params) or {}
             except Exception as e:
-                logger.error(f"回测失败：{e}")
-                stats, buy_signals, sell_signals = None, pd.DataFrame(), pd.DataFrame()
-
-        backtest_results = {
-            'strategy': strategy,
-            'params': params,
-            'stats': stats if stats is not None else {},
-            'buy_signals': buy_signals.to_json(date_format='iso', orient='split') if buy_signals is not None and not buy_signals.empty else None,
-            'sell_signals': sell_signals.to_json(date_format='iso', orient='split') if sell_signals is not None and not sell_signals.empty else None,
-            'indicator_data': None,
-            'indicator_config': {}
-        }
-
-        try:
-            values = strategy_instance.compute_indicator(backtest_data, params)
-            indicator_series = pd.Series(values, index=backtest_data.index, name=strategy.upper())
-            indicator_df = indicator_series.reset_index()
-            indicator_df.columns = ['timestamp', strategy.upper()]
-            backtest_results['indicator_data'] = {
-                'name': strategy.upper(),
-                'values': indicator_df.to_json(date_format='iso', orient='split')
-            }
-            backtest_results['indicator_config'] = strategy_instance.indicator_config(backtest_data, params)
-        except Exception as e:
-            logger.error(f"指标计算错误（{strategy}）：{e}")
-            backtest_results['indicator_data'] = None
-            backtest_results['indicator_config'] = {}
-
+                logger.error(f"指标计算错误（{strategy}）：{e}")
+            backtest_results.append({
+                'strategy': strategy,
+                'params': params,
+                'stats': stats if stats is not None else {},
+                'buy_signals': buy_signals.to_json(date_format='iso', orient='split') if buy_signals is not None and not buy_signals.empty else None,
+                'sell_signals': sell_signals.to_json(date_format='iso', orient='split') if sell_signals is not None and not sell_signals.empty else None,
+                'indicator_data': indicator_data,
+                'indicator_config': indicator_config
+            })
     return (
         inputs,
         display_data.to_json(date_format='iso', orient='split'),
         backtest_data.to_json(date_format='iso', orient='split'),
-        json.dumps(lwc_data),
         json.dumps(backtest_results)
     )
 
-# 更新图表和结果
+# 回调函数：更新图表和结果
 @app.callback(
     [Output('chart-container', 'children'),
      Output('stats-output', 'children'),
      Output('trade-table', 'data')],
     [Input('data-store', 'data'),
      Input('backtest-data-store', 'data'),
-     Input('lwc-data-store', 'data'),
-     Input('chart-type', 'value'),
-     Input('show-volume', 'value'),
+     Input('layer-select', 'value'),
      Input('xaxis-range', 'data'),
-     Input('backtest-results', 'data')],
+     Input('backtest-results', 'data'),
+     Input('cycle-select', 'value')],
+    [State('plotly-kline-plot', 'figure')],
     prevent_initial_call=True
 )
-def update_plot(display_data, backtest_data, lwc_data, chart_type, show_volume, xaxis_range, backtest_results):
-    display_data = pd.read_json(StringIO(display_data), orient='split')
-    display_data.index = pd.to_datetime(display_data.index)
-    display_data.index.name = 'timestamp'
+def update_plot(display_data, backtest_data, layer_select, xaxis_range, backtest_results, cycle, current_fig):
+    # 节流控制
+    last_update_time = getattr(update_plot, '_last_update_time', 0)
+    current_time = time.time()
+    if current_time - last_update_time < 1.5:
+        logger.debug("图表更新被节流")
+        return no_update, no_update, no_update
+    update_plot._last_update_time = current_time
 
-    backtest_data = pd.read_json(StringIO(backtest_data), orient='split')
-    backtest_data.index = pd.to_datetime(backtest_data.index)
-    backtest_data.index.name = 'timestamp'
+    # 反序列化数据
+    try:
+        display_data = pd.read_json(StringIO(display_data), orient='split')
+        display_data.index = pd.to_datetime(display_data.index)
+        display_data.index.name = 'timestamp'
+        backtest_data = pd.read_json(StringIO(backtest_data), orient='split')
+        backtest_data.index = pd.to_datetime(backtest_data.index)
+        backtest_data.index.name = 'timestamp'
+    except Exception as e:
+        logger.error(f"数据反序列化失败：{e}")
+        return no_update, no_update, no_update
 
-    lwc_data = json.loads(lwc_data)
-    
-    stats, buy_signals, sell_signals, indicator_data, indicator_config = None, None, None, None, {}
-    lwc_data['indicator'] = None
-    lwc_data['buy_signals'] = []
-    lwc_data['sell_signals'] = []
-    
-    strategy = None
+    # 处理回测结果
+    stats_list, buy_signals_list, sell_signals_list, indicator_data_list, indicator_config_list = [], [], [], [], []
     if backtest_results:
         try:
             backtest_results = json.loads(backtest_results)
-            strategy = backtest_results.get('strategy', None)
-            params = backtest_results.get('params', {})
-            stats = backtest_results.get('stats', {})
-            buy_signals = pd.read_json(StringIO(backtest_results['buy_signals']), orient='split') if backtest_results.get('buy_signals') else pd.DataFrame()
-            buy_signals.index = pd.to_datetime(buy_signals.index)
-            if 'EntryTime' in buy_signals.columns:
-                buy_signals['EntryTime'] = pd.to_datetime(buy_signals['EntryTime'])
-            sell_signals = pd.read_json(StringIO(backtest_results['sell_signals']), orient='split') if backtest_results.get('sell_signals') else pd.DataFrame()
-            sell_signals.index = pd.to_datetime(sell_signals.index)
-            if 'EntryTime' in sell_signals.columns:
-                sell_signals['EntryTime'] = pd.to_datetime(sell_signals['EntryTime'])
-            if backtest_results.get('indicator_data'):
-                indicator_df = pd.read_json(StringIO(backtest_results['indicator_data']['values']), orient='split')
-                indicator_df['timestamp'] = pd.to_datetime(indicator_df['timestamp'])
-                indicator_name = backtest_results['indicator_data']['name']
-                indicator_values = pd.Series(indicator_df[indicator_name].values, index=indicator_df['timestamp'], name=indicator_name)
-                indicator_data = {
-                    'name': indicator_name,
-                    'values': indicator_values
-                }
-            indicator_config = backtest_results.get('indicator_config', {})
-            
-            if not buy_signals.empty and 'EntryTime' in buy_signals.columns:
-                lwc_data['buy_signals'] = buy_signals.rename(columns={'EntryTime': 'time', 'EntryPrice': 'value'}) \
-                    .assign(
-                        position='aboveBar',
-                        shape='arrowUp',
-                        color='green'
-                    ).to_dict('records')
-            if not sell_signals.empty and 'EntryTime' in sell_signals.columns:
-                lwc_data['sell_signals'] = sell_signals.rename(columns={'EntryTime': 'time', 'EntryPrice': 'value'}) \
-                    .assign(
-                        position='belowBar',
-                        shape='arrowDown',
-                        color='red'
-                    ).to_dict('records')
-            if indicator_data:
-                indicator_values = indicator_data['values']
-                indicator_values = indicator_values[~indicator_values.isna()]
-                indicator_name = indicator_values.name if indicator_values.name is not None else 'indicator'
-                indicator_df = indicator_values.reset_index()
-                indicator_df.columns = ['timestamp', indicator_name]
-                indicator_df = indicator_df.rename(columns={'timestamp': 'time'})
-                lwc_data['indicator'] = {
-                    'name': indicator_data['name'],
-                    'values': indicator_df[['time', indicator_name]]
-                        .rename(columns={indicator_name: 'value'})
-                        .assign(time=lambda x: x['time'].apply(lambda t: t.isoformat()))
-                        .to_dict('records'),
-                    'shapes': indicator_config.get('shapes', [])
-                }
+            for result in backtest_results:
+                strategy = result.get('strategy', None)
+                params = result.get('params', {})
+                stats = result.get('stats', {})
+                buy_signals = pd.read_json(StringIO(result['buy_signals']), orient='split') if result.get('buy_signals') else pd.DataFrame()
+                buy_signals.index = pd.to_datetime(buy_signals.index)
+                if 'EntryTime' in buy_signals.columns:
+                    buy_signals['EntryTime'] = pd.to_datetime(buy_signals['EntryTime'])
+                sell_signals = pd.read_json(StringIO(result['sell_signals']), orient='split') if result.get('sell_signals') else pd.DataFrame()
+                sell_signals.index = pd.to_datetime(sell_signals.index)
+                if 'EntryTime' in sell_signals.columns:
+                    sell_signals['EntryTime'] = pd.to_datetime(sell_signals['EntryTime'])
+                indicator_data = result.get('indicator_data', None)
+                indicator_config = result.get('indicator_config', {})
+                stats_list.append((strategy, params, stats))
+                buy_signals_list.append((strategy, buy_signals))
+                sell_signals_list.append((strategy, sell_signals))
+                indicator_data_list.append((strategy, indicator_data))
+                indicator_config_list.append((strategy, indicator_config))
         except Exception as e:
             logger.error(f"处理 backtest_results 失败：{e}")
-            backtest_results = {}
-
-    if chart_type == 'plotly':
-        show_volume = 'volume' in show_volume
-        fig = create_plotly_kline_plot(
-            display_data,
-            backtest_data,
-            buy_signals if strategy else None,
-            sell_signals if strategy else None,
-            indicator_data if strategy else None,
-            indicator_config if strategy else None,
-            xaxis_range=xaxis_range,
-            show_volume=show_volume
-        )
-        chart_component = dcc.Graph(id='plotly-kline-plot', figure=fig, config={'scrollZoom': True, 'doubleClick': 'reset'})
-    else:
-        chart_component = html.Iframe(
-            id='lwc-iframe',
-            srcDoc=open('D:/策略研究/回测功能/assets/chart.html', 'r').read(),
-            style={'width': '100%', 'height': '800px' if indicator_data else '600px'}
-        )
-    
+            backtest_results = []
+    show_volume = 'volume' in layer_select
+    show_indicators = 'indicators' in layer_select
+    show_signals = 'signals' in layer_select
+    combined_buy_signals = None
+    combined_sell_signals = None
+    combined_indicator_data = []
+    combined_indicator_config = []
+    if backtest_results:
+        for strategy, buy_signals in buy_signals_list:
+            if combined_buy_signals is None:
+                combined_buy_signals = buy_signals.copy()
+                combined_buy_signals['Strategy'] = strategy
+            else:
+                buy_signals['Strategy'] = strategy
+                combined_buy_signals = pd.concat([combined_buy_signals, buy_signals])
+        for strategy, sell_signals in sell_signals_list:
+            if combined_sell_signals is None:
+                combined_sell_signals = sell_signals.copy()
+                combined_sell_signals['Strategy'] = strategy
+            else:
+                sell_signals['Strategy'] = strategy
+                combined_sell_signals = pd.concat([combined_sell_signals, sell_signals])
+        for strategy, indicator_data in indicator_data_list:
+            if indicator_data:
+                indicator_data['name'] = f"{strategy.upper()}_{indicator_data.get('name', 'Indicator')}"
+                combined_indicator_data.append(indicator_data)
+        combined_indicator_config = [cfg[1] for cfg in indicator_config_list]
+    if combined_buy_signals is not None:
+        combined_buy_signals = combined_buy_signals.sort_values('EntryTime').drop_duplicates(subset=['EntryTime', 'Strategy'], keep='last')
+    if combined_sell_signals is not None:
+        combined_sell_signals = combined_sell_signals.sort_values('EntryTime').drop_duplicates(subset=['EntryTime', 'Strategy'], keep='last')
+    # 绘制图表
+    fig = create_plotly_kline_plot(
+        display_data, backtest_data,
+        combined_buy_signals if show_signals else None,
+        combined_sell_signals if show_signals else None,
+        combined_indicator_data if show_indicators else None,
+        combined_indicator_config if show_indicators else None,
+        xaxis_range=xaxis_range, show_volume=show_volume,
+        show_indicators=show_indicators, show_signals=show_signals,
+        cycle=cycle
+    )
+    chart_component = dcc.Graph(id='plotly-kline-plot', figure=fig, config={'scrollZoom': True, 'doubleClick': 'reset'})
+    # 生成统计信息
     stats_text = []
     trade_data = []
-    if stats and strategy:
-        stats_text = [
+    for strategy, params, stats in stats_list:
+        stats_text.extend([
             html.H4(f"策略: {STRATEGIES.get(strategy, {}).get('display_name', '未知策略')}", style={'color': 'white'}),
             html.P(f"描述: {STRATEGIES.get(strategy, {}).get('description', '')}", style={'color': 'white'}),
             html.P(f"参数: {params}", style={'color': 'white'}),
@@ -811,143 +955,51 @@ def update_plot(display_data, backtest_data, lwc_data, chart_type, show_volume, 
             html.P(f"总回报: {stats.get('Return [%]', 0):.2f}%", style={'color': 'white'}),
             html.P(f"最大回撤: {stats.get('Max. Drawdown [%]', 0):.2f}%", style={'color': 'white'}),
             html.P(f"交易次数: {stats.get('# Trades', 0)}", style={'color': 'white'}),
-            html.P(f"胜率: {stats.get('Win Rate [%]', 0):.2f}%", style={'color': 'white'})
-        ]
-        if buy_signals is not None and not buy_signals.empty and 'EntryTime' in buy_signals.columns:
+            html.P(f"胜率: {stats.get('Win Rate [%]', 0):.2f}%", style={'color': 'white'}),
+            html.P(f"夏普比率: {stats.get('Sharpe Ratio', 0):.2f}", style={'color': 'white'}),
+            html.P(f"年化波动率: {stats.get('Annualized Volatility [%]', 0):.2f}%", style={'color': 'white'})
+        ])
+        if combined_buy_signals is not None and not combined_buy_signals.empty and 'EntryTime' in combined_buy_signals.columns:
+            buy_signals = combined_buy_signals[combined_buy_signals['Strategy'] == strategy]
             buy_signals['Type'] = '买入'
-            trade_data.extend(buy_signals[['EntryTime', 'Type', 'EntryPrice']].to_dict('records'))
-        if sell_signals is not None and not sell_signals.empty and 'EntryTime' in sell_signals.columns:
+            trade_data.extend(buy_signals[['EntryTime', 'Type', 'EntryPrice', 'Strategy']].to_dict('records'))
+        if combined_sell_signals is not None and not combined_sell_signals.empty and 'EntryTime' in combined_sell_signals.columns:
+            sell_signals = combined_sell_signals[combined_sell_signals['Strategy'] == strategy]
             sell_signals['Type'] = '卖出'
-            trade_data.extend(sell_signals[['EntryTime', 'Type', 'EntryPrice']].to_dict('records'))
-        trade_data = sorted(trade_data, key=lambda x: x['EntryTime']) if trade_data else []
-    
+            trade_data.extend(sell_signals[['EntryTime', 'Type', 'EntryPrice', 'Strategy']].to_dict('records'))
+    trade_data = sorted(trade_data, key=lambda x: x['EntryTime']) if trade_data else []
     return [chart_component], stats_text, trade_data
 
-# 同步 Lightweight Charts 数据
+# 回调函数：添加垂直线标注
 @app.callback(
-    Output('lwc-data-store', 'data', allow_duplicate=True),
-    [Input('chart-type', 'value'),
-     Input('data-store', 'data'),
-     Input('xaxis-range', 'data'),
-     Input('backtest-results', 'data')],
-    [State('lwc-data-store', 'data')],
+    Output('plotly-kline-plot', 'figure'),
+    Input('add-annotation', 'n_clicks'),
+    [State('plotly-kline-plot', 'figure'),
+     State('xaxis-range', 'data'),
+     State('annotation-time', 'value'),
+     State('annotation-text', 'value'),
+     State('annotations', 'data')],
     prevent_initial_call=True
 )
-def sync_lwc_data(chart_type, stored_data, xaxis_range, backtest_results, lwc_data):
-    if chart_type != 'lwc':
+def add_annotation(n_clicks, current_fig, xaxis_range, annotation_time, annotation_text, annotations):
+    if n_clicks == 0:
         return no_update
-    data = pd.read_json(StringIO(stored_data), orient='split')
-    data.index = pd.to_datetime(data.index)
-    data.index.name = 'timestamp'
-    
-    if xaxis_range:
-        try:
-            range_start = pd.to_datetime(xaxis_range[0])
-            range_end = pd.to_datetime(xaxis_range[1])
-            if range_start > range_end:
-                logger.warning(f"xaxis_range 无效，range_start ({range_start}) 晚于 range_end ({range_end})，交换两者")
-                range_start, range_end = range_end, range_start
-                xaxis_range = [range_start.isoformat(), range_end.isoformat()]
-            display_data = data.loc[range_start:range_end]
-        except Exception as e:
-            logger.error(f"xaxis_range 转换失败：{xaxis_range}, 错误：{e}")
-            display_data = data
-    else:
-        display_data = data
+    fig = go.Figure(current_fig)
+    try:
+        annotation_time = pd.to_datetime(annotation_time) if annotation_time else pd.to_datetime(xaxis_range[1])
+    except:
+        annotation_time = pd.to_datetime(xaxis_range[1])
+    fig.add_vline(
+        x=annotation_time, line_dash='dash', line_color='yellow',
+        annotation_text=annotation_text or '事件'
+    )
+    annotations.append({'time': annotation_time.isoformat(), 'text': annotation_text or '事件'})
+    return fig
 
-    data_reset = display_data.reset_index()
-    if 'timestamp' not in data_reset.columns:
-        logger.error("timestamp 列不存在，检查数据结构")
-        raise KeyError("timestamp 列不存在")
-    
-    data_reset = data_reset.rename(columns={'timestamp': 'time'})
-    
-    lwc_data = {
-        'candlestick': data_reset[['time', 'open', 'high', 'low', 'close']]
-            .assign(time=lambda x: x['time'].apply(lambda t: t.isoformat()))
-            .to_dict('records'),
-        'volume': data_reset.rename(columns={'volume': 'value'})[['time', 'value']]
-            .assign(time=lambda x: x['time'].apply(lambda t: t.isoformat()), color='rgba(0, 150, 255, 0.5)')
-            .to_dict('records'),
-        'indicator': None,
-        'buy_signals': [],
-        'sell_signals': [],
-        'xaxis_range': xaxis_range
-    }
-    
-    if backtest_results:
-        try:
-            backtest_results = json.loads(backtest_results)
-            buy_signals = pd.read_json(StringIO(backtest_results['buy_signals']), orient='split') if backtest_results.get('buy_signals') else pd.DataFrame()
-            buy_signals.index = pd.to_datetime(buy_signals.index)
-            if 'EntryTime' in buy_signals.columns:
-                buy_signals['EntryTime'] = pd.to_datetime(buy_signals['EntryTime'])
-            sell_signals = pd.read_json(StringIO(backtest_results['sell_signals']), orient='split') if backtest_results.get('sell_signals') else pd.DataFrame()
-            sell_signals.index = pd.to_datetime(sell_signals.index)
-            if 'EntryTime' in sell_signals.columns:
-                sell_signals['EntryTime'] = pd.to_datetime(sell_signals['EntryTime'])
-            
-            if not buy_signals.empty and 'EntryTime' in buy_signals.columns:
-                lwc_data['buy_signals'] = buy_signals.rename(columns={'EntryTime': 'time', 'EntryPrice': 'value'}) \
-                    .assign(
-                        position='aboveBar',
-                        shape='arrowUp',
-                        color='green'
-                    ).to_dict('records')
-            if not sell_signals.empty and 'EntryTime' in sell_signals.columns:
-                lwc_data['sell_signals'] = sell_signals.rename(columns={'EntryTime': 'time', 'EntryPrice': 'value'}) \
-                    .assign(
-                        position='belowBar',
-                        shape='arrowDown',
-                        color='red'
-                    ).to_dict('records')
-            
-            if backtest_results.get('indicator_data'):
-                indicator_df = pd.read_json(StringIO(backtest_results['indicator_data']['values']), orient='split')
-                indicator_df['timestamp'] = pd.to_datetime(indicator_df['timestamp'])
-                indicator_name = backtest_results['indicator_data']['name']
-                indicator_values = pd.Series(indicator_df[indicator_name].values, index=indicator_df['timestamp'], name=indicator_name)
-                indicator_values = indicator_values[~indicator_values.isna()]
-                indicator_df = indicator_values.reset_index()
-                indicator_df.columns = ['timestamp', indicator_name]
-                indicator_df = indicator_df.rename(columns={'timestamp': 'time'})
-                lwc_data['indicator'] = {
-                    'name': backtest_results['indicator_data']['name'],
-                    'values': indicator_df[['time', indicator_name]]
-                        .rename(columns={indicator_name: 'value'})
-                        .assign(time=lambda x: x['time'].apply(lambda t: t.isoformat()))
-                        .to_dict('records'),
-                    'shapes': backtest_results.get('indicator_config', {}).get('shapes', [])
-                }
-        except Exception as e:
-            logger.error(f"处理 backtest_results 失败：{e}")
-    
-    return json.dumps(lwc_data)
-
-# 同步 Plotly 缩放范围
-@app.callback(
-    Output('xaxis-range', 'data'),
-    [Input('plotly-kline-plot', 'relayoutData')],
-    [State('xaxis-range', 'data')],
-    prevent_initial_call=True
-)
-def update_xaxis_range(relayout_data, current_range):
-    # 仅当用户拖动图表时更新 xaxis-range，date-range 变化不再影响 xaxis-range
-    if relayout_data and 'xaxis.range[0]' in relayout_data and 'xaxis.range[1]' in relayout_data:
-        new_range = [relayout_data['xaxis.range[0]'], relayout_data['xaxis.range[1]']]
-        try:
-            range_start = pd.to_datetime(new_range[0])
-            range_end = pd.to_datetime(new_range[1])
-            if range_start > range_end:
-                logger.warning(f"relayoutData xaxis_range 无效，range_start ({range_start}) 晚于 range_end ({range_end})，交换两者")
-                range_start, range_end = range_end, range_start
-                new_range = [range_start.isoformat(), range_end.isoformat()]
-        except Exception as e:
-            logger.error(f"relayoutData xaxis_range 转换失败：{new_range}, 错误：{e}")
-            return current_range
-        return new_range
-    return current_range
-
-# 运行
+# 主程序入口
 if __name__ == '__main__':
-    app.run(debug=True)
+    if not os.path.exists(TEST_DATA_PATH):
+        export_test_data(TEST_DATA_PATH)
+    else:
+        logger.info(f"测试数据已存在，跳过导出：{TEST_DATA_PATH}")
+    app.run(debug=False)  # 关闭调试模式，避免重复日志

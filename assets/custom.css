@@ -1,0 +1,13 @@
+/* 自定义周期选择下拉框选项样式 */
+.cycle-dropdown .Select-menu-outer {
+    background-color: #ffffff !important; /* 下拉菜单背景色为白色 */
+}
+
+.cycle-dropdown .Select-option {
+    color: #000000 !important; /* 选项文字色为黑色 */
+    background-color: #ffffff !important; /* 选项背景色为白色 */
+}
+
+.cycle-dropdown .Select-option:hover {
+    background-color: #e0e0e0 !important; /* 鼠标悬停时背景色变灰 */
+}

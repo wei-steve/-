@@ -51,30 +51,22 @@ class RSIStrategy(IStrategy):
         }
 
     def run_backtest(self, data: pd.DataFrame, params: Dict[str, any]) -> Tuple[Dict[str, any], pd.DataFrame, pd.DataFrame]:
-        # 确保 params 参数被正确接收
         rsi_period = params.get('rsi_period', 14)
         overbought = params.get('overbought', 60)
         oversold = params.get('oversold', 40)
         size = params.get('size', 0.1)
 
-        # 计算 RSI
         rsi = self.compute_indicator(data, params)
-
-        # 交易信号
         buy_signals = pd.DataFrame(index=data.index)
         sell_signals = pd.DataFrame(index=data.index)
-        
         buy_signals['EntryTime'] = data.index
         sell_signals['EntryTime'] = data.index
-        
         buy_signals['EntryPrice'] = np.where(rsi < oversold, data['close'], np.nan)
         sell_signals['EntryPrice'] = np.where(rsi > overbought, data['close'], np.nan)
-
         buy_signals = buy_signals.dropna()
         sell_signals = sell_signals.dropna()
 
-        # 运行回测，使用 backtest_engine 对象
-        cerebro = backtest_engine  # 直接使用对象
+        cerebro = backtest_engine
         cerebro.data = data
         cerebro.buy_signals = buy_signals
         cerebro.sell_signals = sell_signals
